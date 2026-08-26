@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from pathlib import Path
 
@@ -98,7 +99,12 @@ NETWORKS CONFIGURED FOR THIS GROUP:
 
 def _cfg():
     with open(CONFIG_PATH, "r", encoding="utf-8-sig") as fh:
-        return json.load(fh)
+        data = json.load(fh)
+    if os.environ.get("GROQ_API_KEY"):
+        data["openai_api_key"] = os.environ["GROQ_API_KEY"]
+    if os.environ.get("BOT_TOKEN"):
+        data["bot_token"] = os.environ["BOT_TOKEN"]
+    return data
 
 
 def ai_ready():
