@@ -669,10 +669,7 @@ async def cmd_setupnewwifi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Please enter new WiFi info like this:\n\n"
             "/setupnewWIFI\n"
             "IP : 203.171.252.90\n"
-            "WIFI NAME : NEW-WIFI\n"
-            "User login : admin\n"
-            "password : admin@123\n"
-            "SSH port : 44222"
+            "WIFI NAME : NEW-WIFI"
         )
         return
     defaults = CFG.get("default_router", {})
@@ -690,8 +687,11 @@ async def cmd_setupnewwifi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         existing[0].update(router)
         action = "updated"
     else:
-        group_cfg.setdefault("routers", []).append(router)
+        if "routers" not in group_cfg:
+            group_cfg["routers"] = []
+        group_cfg["routers"].append(router)
         action = "added"
+    CFG["groups"][str(chat.id)] = group_cfg
     save_config(CFG)
     wifi_list = "\n".join(
         f"  - {r.get('wifi', r.get('name', r.get('host')))}" for r in group_cfg.get("routers", [])
@@ -1029,15 +1029,38 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text("Which WiFi would you like me to check?", reply_markup=build_wifi_keyboard(group_cfg))
             return
+        elif routers:
+            r = dict(routers[0])
+            r.setdefault("check_host", CFG.get("check_host", "8.8.8.8"))
+            await handle_port_check(update, context, group_cfg, text)
+            return
         await handle_port_check(update, context, group_cfg, text)
         return
 
-    if slow_hit and len(group_cfg.get("routers", [])) > 1:
+    if slow_hit and group_cfg and len(group_cfg.get("routers", [])) > 0:
         lang = detect_language(text)
-        if lang == "zh":
-            await update.message.reply_text("请问哪个WiFi有问题？请选择：", reply_markup=build_wifi_keyboard(group_cfg))
+        if len(group_cfg.get("routers", [])) > 1:
+            if lang == "zh":
+                await update.message.reply_text("请问哪个WiFi有问题？请选择：", reply_markup=build_wifi_keyboard(group_cfg))
+            else:
+                await update.message.reply_text("Which WiFi has a problem? Please select:", reply_markup=build_wifi_keyboard(group_cfg))
         else:
-            await update.message.reply_text("Which WiFi has a problem? Please select:", reply_markup=build_wifi_keyboard(group_cfg))
+            router = group_cfg["routers"][0]
+            wifi = router.get("wifi") or router.get("name") or "WiFi"
+            msg = await update.message.reply_text(f"Checking {wifi}...")
+            r = dict(router)
+            r.setdefault("check_host", CFG.get("check_host", "8.8.8.8"))
+            try:
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(mikrotik.check_router, r), timeout=90
+                )
+            except Exception as exc:
+                await msg.edit_text(f"Check failed: {exc}")
+                return
+            report = format_router_report(res)
+            if res["issues"]:
+                report += "\n\n" + suggest_action(res)
+            await msg.edit_text(report[:4000])
         return
 
     if CFG.get("ai_enabled", True) and ai_agent.ai_ready():
