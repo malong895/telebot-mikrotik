@@ -1,0 +1,4 @@
+python-telegram-bot~=21.6
+routeros-api>=0.6
+openai>=1.40,<2
+paramiko>=3.0
