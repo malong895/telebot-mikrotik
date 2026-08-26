@@ -628,7 +628,7 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_setupnewwifi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await update.message.reply_text("Use /setupnewWIFI inside the customer group.")
+        await update.message.reply_text(            "Use /addnewwifi inside the customer group.")
         return
     if not await is_admin(update, context):
         await update.message.reply_text("Admin only.")
@@ -639,68 +639,150 @@ async def cmd_setupnewwifi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = (update.effective_message.text or "").strip()
     lines = text.split("\n")
-    data = {}
+    has_info = any(":" in line and ("ip" in line.lower() or "wifi" in line.lower() or "name" in line.lower()) for line in lines if not line.strip().startswith("/"))
+    if not has_info:
+        await update.message.reply_text(
+            "Add new WiFi to this group.\n\n"
+            "Single example:\n"
+            "/addnewwifi\n"
+            "IP : 203.171.252.90\n"
+            "WIFI NAME : NEW-WIFI\n\n"
+            "Multiple example:\n"
+            "/addnewwifi\n"
+            "IP : 203.171.252.90\n"
+            "WIFI NAME : WIFI-A\n\n"
+            "IP : 203.171.252.91\n"
+            "WIFI NAME : WIFI-B\n\n"
+            "IP : 203.171.252.92\n"
+            "WIFI NAME : WIFI-C"
+        )
+        return
+    entries = []
+    current = {}
     for line in lines:
         line = line.strip()
-        if line.startswith("/setupnewWIFI"):
-            rest = line[len("/setupnewWIFI"):].strip()
-            if rest:
-                data["ip"] = rest
+        if line.startswith("/addnewwifi"):
+            continue
+        if not line:
+            if current.get("ip") and current.get("wifi"):
+                entries.append(current)
+                current = {}
             continue
         if ":" in line:
             key, _, val = line.partition(":")
             key = key.strip().lower()
             val = val.strip()
             if "ip" in key and "wifi" not in key:
-                data["ip"] = val
+                if current.get("ip") and current.get("wifi"):
+                    entries.append(current)
+                    current = {}
+                current["ip"] = val
             elif "wifi" in key or "name" in key:
-                data["wifi"] = val
+                current["wifi"] = val
             elif "user" in key or "login" in key:
-                data["user"] = val
+                current["user"] = val
             elif "pass" in key:
-                data["password"] = val
+                current["password"] = val
             elif "ssh" in key or "port" in key:
                 try:
-                    data["ssh_port"] = int(val)
+                    current["ssh_port"] = int(val)
                 except ValueError:
                     pass
-    if not data.get("ip") or not data.get("wifi"):
+    if current.get("ip") and current.get("wifi"):
+        entries.append(current)
+    if not entries:
         await update.message.reply_text(
-            "Please enter new WiFi info like this:\n\n"
-            "/setupnewWIFI\n"
+            "Please enter IP and WiFi name.\n\n"
+            "Example:\n"
+            "/addnewwifi\n"
             "IP : 203.171.252.90\n"
             "WIFI NAME : NEW-WIFI"
         )
         return
     defaults = CFG.get("default_router", {})
-    router = {
-        "name": data["wifi"],
-        "wifi": data["wifi"],
-        "host": data["ip"],
-        "api_port": defaults.get("api_port", 52743),
-        "ssh_port": data.get("ssh_port", defaults.get("ssh_port", 44222)),
-        "user": data.get("user", defaults.get("user", "admin")),
-        "password": data.get("password", defaults.get("password", "")),
-    }
-    existing = [r for r in group_cfg.get("routers", []) if r.get("host") == data["ip"]]
-    if existing:
-        existing[0].update(router)
-        action = "updated"
-    else:
-        if "routers" not in group_cfg:
-            group_cfg["routers"] = []
-        group_cfg["routers"].append(router)
-        action = "added"
+    added = []
+    updated = []
+    for data in entries:
+        router = {
+            "name": data["wifi"],
+            "wifi": data["wifi"],
+            "host": data["ip"],
+            "api_port": defaults.get("api_port", 52743),
+            "ssh_port": data.get("ssh_port", defaults.get("ssh_port", 44222)),
+            "user": data.get("user", defaults.get("user", "admin")),
+            "password": data.get("password", defaults.get("password", "")),
+        }
+        existing = [r for r in group_cfg.get("routers", []) if r.get("host") == data["ip"] and r.get("wifi") == data["wifi"]]
+        if existing:
+            existing[0].update(router)
+            updated.append(data["wifi"])
+        else:
+            group_cfg.setdefault("routers", []).append(router)
+            added.append(data["wifi"])
     CFG["groups"][str(chat.id)] = group_cfg
     save_config(CFG)
     wifi_list = "\n".join(
         f"  - {r.get('wifi', r.get('name', r.get('host')))}" for r in group_cfg.get("routers", [])
     )
-    await update.message.reply_text(
-        f"WiFi {action} successfully!\n"
-        f"New WiFi: {router['wifi']}\n"
-        f"IP: {router['host']}\n\n"
-        f"All WiFi in this group:\n{wifi_list}"
+    parts = []
+    if added:
+        parts.append(f"Added: {', '.join(added)}")
+    if updated:
+        parts.append(f"Updated: {', '.join(updated)}")
+    parts.append(f"\nAll WiFi in this group:\n{wifi_list}")
+    await update.message.reply_text("\n".join(parts))
+
+
+async def cmd_deletewifi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("Use /deletewifi inside the customer group.")
+        return
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admin only.")
+        return
+    group_cfg = get_group_cfg(chat.id)
+    if not group_cfg or not group_cfg.get("routers"):
+        await update.message.reply_text("No WiFi configured in this group.")
+        return
+    buttons = []
+    for r in group_cfg["routers"]:
+        label = r.get("wifi") or r.get("name") or r.get("host")
+        buttons.append([InlineKeyboardButton(f"🗑 {label}", callback_data=f"dwifi:{label}")])
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text("Select WiFi to delete:", reply_markup=keyboard)
+
+
+async def on_delete_wifi_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if not data.startswith("dwifi:"):
+        return
+    wifi = data[6:]
+    chat = query.message.chat
+    group_cfg = get_group_cfg(chat.id)
+    if not group_cfg or not group_cfg.get("routers"):
+        await query.message.reply_text("No WiFi configured.")
+        return
+    routers = group_cfg["routers"]
+    found = None
+    for i, r in enumerate(routers):
+        label = r.get("wifi") or r.get("name") or r.get("host")
+        if label == wifi:
+            found = i
+            break
+    if found is None:
+        await query.message.reply_text(f"WiFi '{wifi}' not found.")
+        return
+    removed = routers.pop(found)
+    CFG["groups"][str(chat.id)] = group_cfg
+    save_config(CFG)
+    remaining = "\n".join(
+        f"  - {r.get('wifi', r.get('name', r.get('host')))}" for r in routers
+    ) or "  (none)"
+    await query.message.reply_text(
+        f"WiFi '{wifi}' deleted successfully!\n\nRemaining WiFi:\n{remaining}"
     )
 
 
@@ -1142,13 +1224,15 @@ def main():
     app.add_handler(CommandHandler(["help"], cmd_help))
     app.add_handler(CommandHandler(["myid"], cmd_myid))
     app.add_handler(CommandHandler(["setupRT"], cmd_setup))
-    app.add_handler(CommandHandler(["setupnewWIFI"], cmd_setupnewwifi))
+    app.add_handler(CommandHandler(["addnewwifi"], cmd_setupnewwifi))
+    app.add_handler(CommandHandler(["deletewifi"], cmd_deletewifi))
     app.add_handler(CommandHandler(["status"], cmd_status))
     app.add_handler(CommandHandler(["cancel"], cmd_cancel))
     app.add_handler(CommandHandler(["away"], cmd_away))
     app.add_handler(CommandHandler(["pending"], cmd_pending))
     app.add_handler(CommandHandler(["always"], cmd_always))
     app.add_handler(CallbackQueryHandler(on_wifi_button, pattern="^wifi:"))
+    app.add_handler(CallbackQueryHandler(on_delete_wifi_button, pattern="^dwifi:"))
     app.add_handler(CallbackQueryHandler(on_reboot_button, pattern="^reboot:"))
     app.add_handler(
         MessageHandler(
