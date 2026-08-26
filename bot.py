@@ -256,33 +256,32 @@ async def on_wifi_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and user.is_bot:
         return
     group_cfg = get_group_cfg(chat.id) or {"routers": []}
-    name = (user.first_name if user else "") or "friend"
+    routers = group_cfg.get("routers", [])
+    matched = [r for r in routers if (r.get("wifi") or r.get("name") or "") == wifi]
+    if not matched:
+        matched = [r for r in routers if wifi.lower() in (r.get("wifi") or r.get("name") or "").lower()]
+    if not matched:
+        await query.message.reply_text(f"WiFi '{wifi}' not found in config.")
+        return
     try:
         await context.bot.send_chat_action(chat.id, "typing")
     except Exception:
         pass
+    msg = await query.message.reply_text(f"Checking {wifi}...")
+    router = dict(matched[0])
+    router.setdefault("check_host", CFG.get("check_host", "8.8.8.8"))
     try:
-        reply = await asyncio.wait_for(
-            asyncio.to_thread(
-                ai_agent.run_agent,
-                chat.id,
-                name,
-                wifi,
-                group_cfg,
-                context.bot_data,
-                context.bot_data.get("away_mode", False),
-                context.bot.username,
-                chat.title or "",
-            ),
-            timeout=180,
+        res = await asyncio.wait_for(
+            asyncio.to_thread(mikrotik.check_router, router),
+            timeout=90,
         )
     except Exception as exc:
-        log.error(f"AI agent failed (button): {exc}")
-        reply = "😓 The AI assistant is temporarily unavailable. Please try again in a minute."
-    if reply:
-        keyboard = build_wifi_keyboard(group_cfg) if ("?" in reply or "wifi" in reply.lower()) else None
-        await query.message.reply_text(reply[:4000], reply_markup=keyboard)
-        ai_agent.mark_activity(chat.id)
+        await msg.edit_text(f"Check failed for {wifi}: {exc}")
+        return
+    report = format_router_report(res)
+    if res["issues"]:
+        report += "\n\n" + suggest_action(res)
+    await msg.edit_text(report[:4000])
 
 
 async def on_reboot_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -471,10 +470,6 @@ def format_router_report(res):
         parts.append(f"Routes: {res['routes_count']}")
     if res.get("queues"):
         parts.append(f"Queues: {len(res['queues'])}")
-    if res.get("logs_errors"):
-        parts.append(f"Recent errors: {len(res['logs_errors'])}")
-        for log_err in res["logs_errors"][:3]:
-            parts.append(f"  - {log_err[:80]}")
     if res["issues"]:
         parts.append("Problems found:")
         for issue in res["issues"]:
@@ -627,6 +622,85 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"SSL port: {router['api_port']}\n"
         f"SSH port: {router['ssh_port']}\n"
         f"User: {router['user']}"
+    )
+
+
+async def cmd_setupnewwifi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("Use /setupnewWIFI inside the customer group.")
+        return
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admin only.")
+        return
+    group_cfg = get_group_cfg(chat.id)
+    if not group_cfg:
+        await update.message.reply_text("This group has no router yet. Use /setupRT first to add the first one.")
+        return
+    text = (update.effective_message.text or "").strip()
+    lines = text.split("\n")
+    data = {}
+    for line in lines:
+        line = line.strip()
+        if line.startswith("/setupnewWIFI"):
+            rest = line[len("/setupnewWIFI"):].strip()
+            if rest:
+                data["ip"] = rest
+            continue
+        if ":" in line:
+            key, _, val = line.partition(":")
+            key = key.strip().lower()
+            val = val.strip()
+            if "ip" in key and "wifi" not in key:
+                data["ip"] = val
+            elif "wifi" in key or "name" in key:
+                data["wifi"] = val
+            elif "user" in key or "login" in key:
+                data["user"] = val
+            elif "pass" in key:
+                data["password"] = val
+            elif "ssh" in key or "port" in key:
+                try:
+                    data["ssh_port"] = int(val)
+                except ValueError:
+                    pass
+    if not data.get("ip") or not data.get("wifi"):
+        await update.message.reply_text(
+            "Please enter new WiFi info like this:\n\n"
+            "/setupnewWIFI\n"
+            "IP : 203.171.252.90\n"
+            "WIFI NAME : NEW-WIFI\n"
+            "User login : admin\n"
+            "password : admin@123\n"
+            "SSH port : 44222"
+        )
+        return
+    defaults = CFG.get("default_router", {})
+    router = {
+        "name": data["wifi"],
+        "wifi": data["wifi"],
+        "host": data["ip"],
+        "api_port": defaults.get("api_port", 52743),
+        "ssh_port": data.get("ssh_port", defaults.get("ssh_port", 44222)),
+        "user": data.get("user", defaults.get("user", "admin")),
+        "password": data.get("password", defaults.get("password", "")),
+    }
+    existing = [r for r in group_cfg.get("routers", []) if r.get("host") == data["ip"]]
+    if existing:
+        existing[0].update(router)
+        action = "updated"
+    else:
+        group_cfg.setdefault("routers", []).append(router)
+        action = "added"
+    save_config(CFG)
+    wifi_list = "\n".join(
+        f"  - {r.get('wifi', r.get('name', r.get('host')))}" for r in group_cfg.get("routers", [])
+    )
+    await update.message.reply_text(
+        f"WiFi {action} successfully!\n"
+        f"New WiFi: {router['wifi']}\n"
+        f"IP: {router['host']}\n\n"
+        f"All WiFi in this group:\n{wifi_list}"
     )
 
 
@@ -947,7 +1021,23 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if port_hit:
+        routers = group_cfg.get("routers", [])
+        if len(routers) > 1:
+            lang = detect_language(text)
+            if lang == "zh":
+                await update.message.reply_text("请问要检查哪个WiFi？", reply_markup=build_wifi_keyboard(group_cfg))
+            else:
+                await update.message.reply_text("Which WiFi would you like me to check?", reply_markup=build_wifi_keyboard(group_cfg))
+            return
         await handle_port_check(update, context, group_cfg, text)
+        return
+
+    if slow_hit and len(group_cfg.get("routers", [])) > 1:
+        lang = detect_language(text)
+        if lang == "zh":
+            await update.message.reply_text("请问哪个WiFi有问题？请选择：", reply_markup=build_wifi_keyboard(group_cfg))
+        else:
+            await update.message.reply_text("Which WiFi has a problem? Please select:", reply_markup=build_wifi_keyboard(group_cfg))
         return
 
     if CFG.get("ai_enabled", True) and ai_agent.ai_ready():
@@ -1029,6 +1119,7 @@ def main():
     app.add_handler(CommandHandler(["help"], cmd_help))
     app.add_handler(CommandHandler(["myid"], cmd_myid))
     app.add_handler(CommandHandler(["setupRT"], cmd_setup))
+    app.add_handler(CommandHandler(["setupnewWIFI"], cmd_setupnewwifi))
     app.add_handler(CommandHandler(["status"], cmd_status))
     app.add_handler(CommandHandler(["cancel"], cmd_cancel))
     app.add_handler(CommandHandler(["away"], cmd_away))
