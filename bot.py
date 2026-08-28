@@ -123,6 +123,12 @@ def load_config():
         data = {}
     cfg = dict(DEFAULTS)
     cfg.update(data)
+    if os.environ.get("GROUP_CONFIG"):
+        try:
+            groups = json.loads(os.environ["GROUP_CONFIG"])
+            cfg["groups"] = groups
+        except Exception:
+            pass
     tpl_cfg = dict(DEFAULTS["templates"])
     tpl_cfg.update(data.get("templates", {}))
     cfg["templates"] = tpl_cfg
