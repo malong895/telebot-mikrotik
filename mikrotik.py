@@ -40,7 +40,7 @@ def _connect(router):
             password=password,
             port=ssl_port,
             plaintext_login=True,
-            use_ssl=True,
+            use_ssl=False,
         )
         api = pool.get_api()
         return pool, api
@@ -460,7 +460,9 @@ def _routes_count(ssh):
 def check_router(router):
     result = {
         "name": router.get("name") or router["host"],
+        "wifi": router.get("wifi") or router.get("name") or router["host"],
         "host": router["host"],
+        "check_host": router.get("check_host", "8.8.8.8"),
         "online": False,
         "cpu": None,
         "mem_free_mb": None,
@@ -521,7 +523,6 @@ def check_router(router):
         if wan:
             if use_ssh:
                 rx1, tx1 = _iface_bytes_ssh(ssh, wan)
-                time.sleep(2)
                 rx2, tx2 = _iface_bytes_ssh(ssh, wan)
             else:
                 rx1, tx1 = _iface_bytes(api, wan)
@@ -537,7 +538,6 @@ def check_router(router):
             result["interfaces"] = _all_interfaces_ssh(ssh)
             result["dns"] = _dns_status_ssh(ssh)
             result["hotspot_active"] = _hotspot_active_ssh(ssh)
-            result["logs_errors"] = _system_logs(ssh, 5)
             result["temperature"] = _system_temp(ssh)
             result["disk_free"] = _disk_space(ssh)
             result["active_conns"] = _active_connections(ssh)
@@ -597,10 +597,6 @@ def check_router(router):
             pass
         elif result["online"]:
             result["issues"].append("DNS not configured")
-        if result.get("logs_errors"):
-            error_count = len(result["logs_errors"])
-            if error_count > 0:
-                result["issues"].append(f"{error_count} recent errors in logs")
         if result["active_conns"] > 5000:
             result["issues"].append(f"High connection count: {result['active_conns']}")
     finally:

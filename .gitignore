@@ -1,4 +1,14 @@
+# Runtime secrets and customer data
+config.json
+.env
+ai_memory/
+logs/
+use-it-later/
+
+# Local runtime
 venv/
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+
+# Supervisor state
+*.pid

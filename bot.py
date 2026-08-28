@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -55,7 +56,7 @@ DEFAULTS = {
     "away_notice_cooldown_sec": 300,
     "confirm_timeout_sec": 600,
     "check_host": "8.8.8.8",
-    "default_router": {"api_port": 8292, "user": "admin", "password": "REMOVED-EXPOSED-SECRET"},
+    "default_router": {"api_port": 8292, "user": "admin", "password": ""},
     "groups": {},
     "templates": {
         "new_connect_reply": (
@@ -107,6 +108,10 @@ DEFAULTS = {
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO
 )
+# python-telegram-bot uses token-bearing Bot API URLs internally. Keep HTTP
+# client request lines out of persistent logs so credentials are never written.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("itbot")
 
 
@@ -209,6 +214,53 @@ def contains_any(text_lower, words):
     return any(w.lower() in text_lower for w in words)
 
 
+def is_valid_router_host(value):
+    """Accept an IP address or plain DNS hostname, never chat handles/URLs."""
+    host = str(value or "").strip()
+    if not host or host.startswith("@") or "://" in host or any(c.isspace() for c in host):
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if len(host) > 253 or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return False
+    labels = host.rstrip(".").split(".")
+    return all(
+        label
+        and len(label) <= 63
+        and not label.startswith("-")
+        and not label.endswith("-")
+        for label in labels
+    )
+
+
+def resolve_message_group_cfg(chat_id, chat_type):
+    """Resolve router context, including all networks for an admin DM."""
+    direct = get_group_cfg(chat_id)
+    if direct:
+        return direct
+    admin_ids = {str(value) for value in CFG.get("admin_chat_ids", [])}
+    if chat_type != ChatType.PRIVATE or str(chat_id) not in admin_ids:
+        return None
+
+    routers = []
+    seen = set()
+    for configured_group in CFG.get("groups", {}).values():
+        for configured_router in configured_group.get("routers", []):
+            host = configured_router.get("host")
+            wifi = configured_router.get("wifi") or configured_router.get("name") or host
+            if not is_valid_router_host(host):
+                continue
+            key = (str(host).lower(), str(wifi).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            routers.append(dict(configured_router))
+    return {"title": "Admin private chat", "routers": routers, "always_reply": True}
+
+
 def extract_port(text):
     text_lower = text.lower()
     port_match = re.search(r'port\s*(\d)', text_lower)
@@ -255,7 +307,7 @@ async def on_wifi_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     if user and user.is_bot:
         return
-    group_cfg = get_group_cfg(chat.id) or {"routers": []}
+    group_cfg = resolve_message_group_cfg(chat.id, chat.type) or {"routers": []}
     routers = group_cfg.get("routers", [])
     matched = [r for r in routers if (r.get("wifi") or r.get("name") or "") == wifi]
     if not matched:
@@ -272,15 +324,13 @@ async def on_wifi_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     router.setdefault("check_host", CFG.get("check_host", "8.8.8.8"))
     try:
         res = await asyncio.wait_for(
-            asyncio.to_thread(mikrotik.check_router, router),
-            timeout=90,
+            asyncio.to_thread(                    mikrotik.check_router, router),
+            timeout=30,
         )
     except Exception as exc:
         await msg.edit_text(f"Check failed for {wifi}: {exc}")
         return
-    report = format_router_report(res)
-    if res["issues"]:
-        report += "\n\n" + suggest_action(res)
+    report = render_router_check_response(res)
     await msg.edit_text(report[:4000])
 
 
@@ -298,6 +348,9 @@ async def on_reboot_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = query.message.chat
     user = query.from_user
     if user and user.is_bot:
+        return
+    if not await is_admin(update, context):
+        await query.message.reply_text("Admin only.")
         return
     pending = context.bot_data.get("pending", {})
     key = str(chat.id)
@@ -395,7 +448,7 @@ async def run_group_checks(group_cfg):
         r.setdefault("check_host", CFG.get("check_host", "8.8.8.8"))
         try:
             res = await asyncio.wait_for(
-                asyncio.to_thread(mikrotik.check_router, r), timeout=90
+                asyncio.to_thread(mikrotik.check_router, r), timeout=30
             )
         except Exception as exc:
             lines.append(f"Router {r.get('name', r['host'])} ({r['host']}): check failed ({exc})")
@@ -432,7 +485,7 @@ def format_router_report(res):
         avg = res["ping"]["avg_ms"]
         avg_txt = f"{avg:.0f} ms" if avg else "-"
         parts.append(
-            f"Ping {router.get('check_host', '8.8.8.8')}: avg {avg_txt}, loss {res['ping']['loss_pct']:.0f}%"
+            f"Ping {res.get('check_host', '8.8.8.8')}: avg {avg_txt}, loss {res['ping']['loss_pct']:.0f}%"
         )
     if res["users_total"] is not None:
         wifi_part = f"WiFi users: {res['users_total']}"
@@ -488,6 +541,11 @@ def suggest_action(res):
     if "cpu high" in joined:
         return "reboot"
     return None
+
+
+def render_router_check_response(res):
+    """Render a health result without concatenating a missing action hint."""
+    return format_router_report(res)
 
 
 async def cmd_always(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -560,6 +618,9 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.message.reply_text("Use /setupRT inside the customer group.")
         return
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admin only.")
+        return
     text = (update.effective_message.text or "").strip()
     lines = text.split("\n")
     data = {}
@@ -598,6 +659,9 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SSH port : 44222"
         )
         return
+    if not is_valid_router_host(data["ip"]):
+        await update.message.reply_text("Invalid router IP address or hostname.")
+        return
     defaults = CFG.get("default_router", {})
     router = {
         "name": data.get("wifi", data["ip"]),
@@ -628,7 +692,7 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_setupnewwifi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await update.message.reply_text(            "Use /addnewwifi inside the customer group.")
+        await update.message.reply_text("Use /addnewwifi inside the customer group.")
         return
     if not await is_admin(update, context):
         await update.message.reply_text("Admin only.")
@@ -642,95 +706,91 @@ async def cmd_setupnewwifi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_info = any(":" in line and ("ip" in line.lower() or "wifi" in line.lower() or "name" in line.lower()) for line in lines if not line.strip().startswith("/"))
     if not has_info:
         await update.message.reply_text(
-            "Add new WiFi to this group.\n\n"
-            "Single example:\n"
-            "/addnewwifi\n"
-            "IP : 203.171.252.90\n"
-            "WIFI NAME : NEW-WIFI\n\n"
-            "Multiple example:\n"
-            "/addnewwifi\n"
-            "IP : 203.171.252.90\n"
-            "WIFI NAME : WIFI-A\n\n"
-            "IP : 203.171.252.91\n"
-            "WIFI NAME : WIFI-B\n\n"
-            "IP : 203.171.252.92\n"
-            "WIFI NAME : WIFI-C"
-        )
-        return
-    entries = []
-    current = {}
-    for line in lines:
-        line = line.strip()
-        if line.startswith("/addnewwifi"):
-            continue
-        if not line:
-            if current.get("ip") and current.get("wifi"):
-                entries.append(current)
-                current = {}
-            continue
-        if ":" in line:
-            key, _, val = line.partition(":")
-            key = key.strip().lower()
-            val = val.strip()
-            if "ip" in key and "wifi" not in key:
-                if current.get("ip") and current.get("wifi"):
-                    entries.append(current)
-                    current = {}
-                current["ip"] = val
-            elif "wifi" in key or "name" in key:
-                current["wifi"] = val
-            elif "user" in key or "login" in key:
-                current["user"] = val
-            elif "pass" in key:
-                current["password"] = val
-            elif "ssh" in key or "port" in key:
-                try:
-                    current["ssh_port"] = int(val)
-                except ValueError:
-                    pass
-    if current.get("ip") and current.get("wifi"):
-        entries.append(current)
-    if not entries:
-        await update.message.reply_text(
-            "Please enter IP and WiFi name.\n\n"
+            "Add one new WiFi to this group.\n\n"
             "Example:\n"
             "/addnewwifi\n"
             "IP : 203.171.252.90\n"
             "WIFI NAME : NEW-WIFI"
         )
         return
-    defaults = CFG.get("default_router", {})
-    added = []
-    updated = []
-    for data in entries:
-        router = {
-            "name": data["wifi"],
-            "wifi": data["wifi"],
-            "host": data["ip"],
-            "api_port": defaults.get("api_port", 52743),
-            "ssh_port": data.get("ssh_port", defaults.get("ssh_port", 44222)),
-            "user": data.get("user", defaults.get("user", "admin")),
-            "password": data.get("password", defaults.get("password", "")),
+    data = {}
+    for line in lines:
+        line = line.strip()
+        if line.startswith("/addnewwifi"):
+            continue
+        if ":" in line:
+            key, _, val = line.partition(":")
+            key = key.strip().lower()
+            val = val.strip()
+            if "ip" in key and "wifi" not in key:
+                data["ip"] = val
+            elif "wifi" in key or "name" in key:
+                data["wifi"] = val
+            elif "user" in key or "login" in key:
+                data["user"] = val
+            elif "pass" in key:
+                data["password"] = val
+            elif "ssh" in key or "port" in key:
+                try:
+                    data["ssh_port"] = int(val)
+                except ValueError:
+                    pass
+    if not data.get("ip") or not data.get("wifi"):
+        await update.message.reply_text(
+            "Please enter both IP and WiFi name.\n\n"
+            "Example:\n"
+            "/addnewwifi\n"
+            "IP : 203.171.252.90\n"
+            "WIFI NAME : NEW-WIFI"
+        )
+        return
+    if not is_valid_router_host(data["ip"]):
+        await update.message.reply_text("Invalid router IP address or hostname.")
+        return
+    existing_same_wifi = [r for r in group_cfg.get("routers", []) if r.get("wifi") == data["wifi"]]
+    if existing_same_wifi:
+        await update.message.reply_text(
+            f"WiFi name '{data['wifi']}' already exists!\n"
+            f"IP: {existing_same_wifi[0].get('host')}\n\n"
+            f"Please use a different WiFi name or delete the old one first with /deletewifi"
+        )
+        return
+    existing_same_ip = [r for r in group_cfg.get("routers", []) if r.get("host") == data["ip"]]
+    if existing_same_ip:
+        other_name = existing_same_wifi[0].get("wifi") if existing_same_wifi else existing_same_ip[0].get("wifi")
+        await update.message.reply_text(
+            f"IP {data['ip']} already exists for WiFi '{existing_same_ip[0].get('wifi')}'!\n\n"
+            f"Do you want to add another WiFi on the same IP?\n"
+            f"Reply YES to confirm or NO to cancel."
+        )
+        context.bot_data.setdefault("pending_add", {})[str(chat.id)] = {
+            "data": data,
+            "group_cfg": group_cfg,
+            "expires": time.time() + 120,
         }
-        existing = [r for r in group_cfg.get("routers", []) if r.get("host") == data["ip"] and r.get("wifi") == data["wifi"]]
-        if existing:
-            existing[0].update(router)
-            updated.append(data["wifi"])
-        else:
-            group_cfg.setdefault("routers", []).append(router)
-            added.append(data["wifi"])
+        return
+    defaults = CFG.get("default_router", {})
+    router = {
+        "name": data["wifi"],
+        "wifi": data["wifi"],
+        "host": data["ip"],
+        "api_port": defaults.get("api_port", 52743),
+        "ssh_port": data.get("ssh_port", defaults.get("ssh_port", 44222)),
+        "user": data.get("user", defaults.get("user", "admin")),
+        "password": data.get("password", defaults.get("password", "")),
+    }
+    group_cfg.setdefault("routers", []).append(router)
     CFG["groups"][str(chat.id)] = group_cfg
     save_config(CFG)
     wifi_list = "\n".join(
         f"  - {r.get('wifi', r.get('name', r.get('host')))}" for r in group_cfg.get("routers", [])
     )
-    parts = []
-    if added:
-        parts.append(f"Added: {', '.join(added)}")
-    if updated:
-        parts.append(f"Updated: {', '.join(updated)}")
-    parts.append(f"\nAll WiFi in this group:\n{wifi_list}")
-    await update.message.reply_text("\n".join(parts))
+    await update.message.reply_text(
+        f"WiFi added successfully!\n"
+        f"Name: {router['wifi']}\n"
+        f"IP: {router['host']}\n\n"
+        f"All WiFi in this group:\n{wifi_list}"
+    )
 
 
 async def cmd_deletewifi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -761,6 +821,9 @@ async def on_delete_wifi_button(update: Update, context: ContextTypes.DEFAULT_TY
         return
     wifi = data[6:]
     chat = query.message.chat
+    if not await is_admin(update, context):
+        await query.message.reply_text("Admin only.")
+        return
     group_cfg = get_group_cfg(chat.id)
     if not group_cfg or not group_cfg.get("routers"):
         await query.message.reply_text("No WiFi configured.")
@@ -865,6 +928,9 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return False
     user_text = (update.effective_message.text or "").strip().lower()
     if contains_any(user_text, CFG.get("confirm_words", [])):
+        if not await is_admin(update, context):
+            await update.effective_message.reply_text("Admin only.")
+            return True
         del pending[key]
         router = job["router"]
         action = job["action"]
@@ -1046,7 +1112,50 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await handle_confirm(update, context):
         return
 
-    group_cfg = get_group_cfg(chat.id)
+    pending_add = context.bot_data.get("pending_add", {})
+    add_key = str(chat.id)
+    if add_key in pending_add:
+        job = pending_add[add_key]
+        if time.time() < job.get("expires", 0):
+            user_text = text.strip().lower()
+            if user_text in ("yes", "y", "ok", "confirm", "no", "n", "cancel"):
+                if not await is_admin(update, context):
+                    await update.message.reply_text("Admin only.")
+                    return
+            if user_text in ("yes", "y", "ok", "confirm"):
+                data = job["data"]
+                group_cfg = job["group_cfg"]
+                defaults = CFG.get("default_router", {})
+                router = {
+                    "name": data["wifi"],
+                    "wifi": data["wifi"],
+                    "host": data["ip"],
+                    "api_port": defaults.get("api_port", 52743),
+                    "ssh_port": data.get("ssh_port", defaults.get("ssh_port", 44222)),
+                    "user": data.get("user", defaults.get("user", "admin")),
+                    "password": data.get("password", defaults.get("password", "")),
+                }
+                group_cfg.setdefault("routers", []).append(router)
+                CFG["groups"][str(chat.id)] = group_cfg
+                save_config(CFG)
+                del pending_add[add_key]
+                wifi_list = "\n".join(
+                    f"  - {r.get('wifi', r.get('name', r.get('host')))}" for r in group_cfg.get("routers", [])
+                )
+                await update.message.reply_text(
+                    f"WiFi added!\n"
+                    f"Name: {router['wifi']}\n"
+                    f"IP: {router['host']}\n\n"
+                    f"All WiFi in this group:\n{wifi_list}"
+                )
+            elif user_text in ("no", "n", "cancel"):
+                del pending_add[add_key]
+                await update.message.reply_text("Cancelled.")
+            return
+        else:
+            del pending_add[add_key]
+
+    group_cfg = resolve_message_group_cfg(chat.id, chat.type)
 
     slow_hit = contains_any(text_lower, CFG.get("slow_keywords", []))
     new_hit = contains_any(text_lower, CFG.get("new_connect_keywords", []))
@@ -1134,14 +1243,12 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r.setdefault("check_host", CFG.get("check_host", "8.8.8.8"))
             try:
                 res = await asyncio.wait_for(
-                    asyncio.to_thread(mikrotik.check_router, r), timeout=90
+                    asyncio.to_thread(mikrotik.check_router, r), timeout=30
                 )
             except Exception as exc:
                 await msg.edit_text(f"Check failed: {exc}")
                 return
-            report = format_router_report(res)
-            if res["issues"]:
-                report += "\n\n" + suggest_action(res)
+            report = render_router_check_response(res)
             await msg.edit_text(report[:4000])
         return
 

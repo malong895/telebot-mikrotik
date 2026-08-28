@@ -1,0 +1,31 @@
+{
+  "bot_token": "PUT-YOUR-TELEGRAM-BOT-TOKEN-HERE",
+  "admin_chat_ids": [123456789],
+  "openai_api_key": "PUT-YOUR-GROQ-API-KEY-HERE",
+  "openai_model": "openai/gpt-oss-120b",
+  "ai_window_min": 30,
+  "ai_enabled": true,
+  "check_host": "8.8.8.8",
+  "default_router": {
+    "api_port": 8292,
+    "ssh_port": 22,
+    "user": "monitoring-user",
+    "password": "CHANGE-ME"
+  },
+  "groups": {
+    "-1001111111111": {
+      "title": "Example Customer Group",
+      "routers": [
+        {
+          "name": "Example-Router",
+          "wifi": "EXAMPLE-WIFI",
+          "host": "192.0.2.10",
+          "api_port": 8292,
+          "ssh_port": 22,
+          "user": "monitoring-user",
+          "password": "CHANGE-ME"
+        }
+      ]
+    }
+  }
+}

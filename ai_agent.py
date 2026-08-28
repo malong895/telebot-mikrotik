@@ -86,7 +86,9 @@ GREETINGS: if the customer only says hello / hi / good morning, greet back natur
 
 CHECKS: when a customer reports slow/no internet, you need to know WHICH WiFi. Look in the conversation; if unknown, ask: "What is your WiFi name?" Then call get_router_status with that name. After a tool result, explain in simple words: is it online, speeds vs package, how many users on the WiFi, ping loss, PPPoE. Give one or two simple suggestions (pause big downloads, restart their device, check distance from router). Ask a follow-up question to continue helping. You may call get_customer_plan to compare usage with the package.
 
-MAINTENANCE SAFETY - MOST IMPORTANT: NEVER say you rebooted or disconnected anything. You can never execute disruptive actions yourself. Only READ tools run directly. If a check shows a real problem and you want to offer reboot / PPPoE reconnect, call request_maintenance, then tell the customer: the fix may disconnect the network for a few minutes, reply YES to allow or /cancel to stop. The system handles the confirmation.
+MONITORING TRUTH: monitoring_status=unreachable means only that the bot cannot log in to the router. It does NOT prove that the customer's internet, router, or power is offline. Say the monitoring connection is unavailable. Do NOT offer maintenance, a reboot, or power troubleshooting in this case.
+
+MAINTENANCE SAFETY - MOST IMPORTANT: NEVER say you rebooted or disconnected anything. You can never execute disruptive actions yourself. Only READ tools run directly. If a reachable check shows a real problem and you want to offer reboot / PPPoE reconnect, call request_maintenance. Ask for YES only when that tool returns status=waiting_for_customer_YES. The system handles the confirmation.
 
 HONESTY: if a tool returns an error or cannot connect, say you could not reach the monitoring system right now and suggest trying again soon. NEVER invent numbers or claim a check happened when it did not.
 
@@ -156,14 +158,27 @@ def _match_routers(routers, wifi):
         }
         if want in names or (len(want) >= 3 and any(want in n for n in names if n)):
             out.append(r)
-    return out or routers
+    return out
 
 
 def _compact_status(res):
+    management_reachable = bool(res.get("online"))
+    ping = res.get("ping") or {}
+    internet_status = "unknown"
+    if management_reachable and ping.get("loss_pct") is not None:
+        loss = float(ping["loss_pct"])
+        if loss >= 100:
+            internet_status = "offline"
+        elif loss > 10:
+            internet_status = "degraded"
+        else:
+            internet_status = "online"
     return {
         "router": res.get("name"),
         "wifi": res.get("wifi"),
         "online": res.get("online"),
+        "monitoring_status": "reachable" if management_reachable else "unreachable",
+        "internet_status": internet_status,
         "error": res.get("error"),
         "cpu_percent": res.get("cpu"),
         "ram_free_mb": res.get("mem_free_mb"),
@@ -222,6 +237,23 @@ def execute_tool(name, args, group_cfg, bot_data, chat_id, chat_title):
             selected = _match_routers(routers, args.get("wifi"))
             if not selected:
                 return {"error": "no matching router"}
+            router = dict(selected[0])
+            router.setdefault("check_host", "8.8.8.8")
+            try:
+                health = mikrotik.check_router(router)
+            except Exception as exc:
+                health = {"online": False, "error": str(exc)}
+            if not health.get("online"):
+                return {
+                    "status": "router_management_unreachable",
+                    "action": action,
+                    "action_blocked": True,
+                    "reason": (
+                        "The monitoring connection is unavailable. This does not prove "
+                        "the customer's internet or router power is down. Do not offer "
+                        "a reboot or ask for YES."
+                    ),
+                }
             bot_data.setdefault("pending", {})[str(chat_id)] = {
                 "router": selected[0],
                 "action": action,
@@ -281,7 +313,7 @@ def run_agent(chat_id, user_name, text, group_cfg, bot_data, away, bot_username,
     ] + history
 
     reply = None
-    for _ in range(4):
+    for _ in range(2):
         response = client.chat.completions.create(
             model=model,
             messages=messages,
