@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: itbot
+    runtime: python
+    repo: https://github.com/malong895/telebot-mikrotik.git
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    env:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ADMIN_CHAT_IDS
+        value: "8061411147"
+      - key: GROUP_CONFIG
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"

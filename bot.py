@@ -5,8 +5,10 @@ import logging
 import os
 import random
 import re
+import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -1327,6 +1329,27 @@ async def legacy_flow(
     await handle_away_notice(update, context)
 
 
+def _start_health_server(port):
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+    except Exception as exc:
+        log.warning("Health server skipped: %s", exc)
+        return
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info("Health server on port %s", port)
+
+
 def main():
     token = CFG.get("bot_token", "")
     if not token or "PUT" in token.upper():
@@ -1356,6 +1379,9 @@ def main():
         )
     )
     log.info("Bot starting...")
+    port = os.environ.get("PORT")
+    if port:
+        _start_health_server(int(port))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
