@@ -1,0 +1,21 @@
+name: itbot
+services:
+  - name: itbot
+    instance_types:
+      - free
+    ports:
+      - port: 8000
+    git:
+      repository_url: https://github.com/malong895/telebot-mikrotik.git
+      branch: main
+    build_command: "pip install -r requirements.txt"
+    run_command: "python3 bot.py"
+    env:
+      - name: BOT_TOKEN
+        value: ""
+      - name: GROQ_API_KEY
+        value: ""
+      - name: ADMIN_CHAT_IDS
+        value: "8061411147"
+      - name: GROUP_CONFIG
+        value: ""
