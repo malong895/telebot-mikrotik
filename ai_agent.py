@@ -114,9 +114,50 @@ def _cfg():
     return data
 
 
+_FAILS = []
+_FAIL_THRESHOLD = 2
+_FAIL_COOLDOWN = 600
+
+
 def ai_ready():
     key = _cfg().get("openai_api_key", "")
-    return bool(key) and "PUT" not in key.upper()
+    if not (bool(key) and "PUT" not in key.upper()):
+        return False
+    if len(_FAILS) >= _FAIL_THRESHOLD:
+        if time.time() - _FAILS[-1] > _FAIL_COOLDOWN:
+            _FAILS.clear()
+        else:
+            return False
+    return True
+
+
+def record_failure():
+    _FAILS.append(time.time())
+    if len(_FAILS) > 50:
+        _FAILS.pop(0)
+
+
+def precheck_key():
+    """Cheap key check at startup. If the key is invalid (auth 401), pre-seed the
+    circuit breaker so the bot routes to the legacy auto-reply flow immediately
+    instead of returning 'AI unavailable' for every customer message."""
+    cfg = _cfg()
+    api_key = cfg.get("openai_api_key", "")
+    if not api_key or "PUT" in api_key.upper():
+        return False
+    import openai
+    client = OpenAI(api_key=api_key, base_url=cfg.get("openai_base_url") or None)
+    try:
+        client.chat.completions.create(
+            model=cfg.get("openai_model") or "gpt-4o-mini",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
+        return True
+    except openai.AuthenticationError:
+        now = time.time()
+        _FAILS.extend([now, now])
+        return False
 
 
 def _memory_path(chat_id):

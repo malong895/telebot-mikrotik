@@ -1285,6 +1285,7 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as exc:
             log.error(f"AI agent failed: {exc}")
+            ai_agent.record_failure()
             reply = "😓 The AI assistant is temporarily unavailable. Please try again in a minute."
         if reply:
             keyboard = None
@@ -1351,7 +1352,15 @@ def _start_health_server(port):
     log.info("Health server on port %s", port)
 
 
+def _precheck_ai_key():
+    try:
+        ai_agent.precheck_key()
+    except Exception as exc:
+        log.warning("AI key precheck failed (will use fallback): %s", exc)
+
+
 def main():
+    threading.Thread(target=_precheck_ai_key, daemon=True).start()
     token = CFG.get("bot_token", "")
     if not token or "PUT" in token.upper():
         raise SystemExit("Put your bot token into config.json first (bot_token).")
