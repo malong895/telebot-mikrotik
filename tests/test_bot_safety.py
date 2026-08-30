@@ -242,6 +242,88 @@ class AdminSafetyTests(unittest.TestCase):
         self.assertEqual("Admin only.", update.message.replies[-1][0])
 
 
+class GroupAutoReplyTests(unittest.TestCase):
+    def test_always_command_reports_default_on_state(self):
+        update = DummyUpdate("/always")
+        context = DummyContext()
+        cfg = {
+            "groups": {
+                str(update.effective_chat.id): {
+                    "title": update.effective_chat.title,
+                    "routers": [],
+                }
+            }
+        }
+
+        with patch.object(bot, "CFG", cfg), patch.object(
+            bot, "is_admin", AsyncMock(return_value=True)
+        ):
+            asyncio.run(bot.cmd_always(update, context))
+
+        self.assertIn("Always-reply is ON.", update.message.replies[-1][0])
+
+    def test_configured_group_replies_to_ordinary_message_by_default(self):
+        update = DummyUpdate("Please answer my question.")
+        context = DummyContext()
+        cfg = {
+            "admin_chat_ids": [],
+            "groups": {
+                str(update.effective_chat.id): {
+                    "title": update.effective_chat.title,
+                    "routers": [],
+                }
+            },
+            "ai_enabled": True,
+            "ai_window_min": 30,
+            "slow_keywords": [],
+            "new_connect_keywords": [],
+            "greeting_keywords": [],
+            "port_keywords": [],
+            "non_duty_keywords": [],
+        }
+
+        with patch.object(bot, "CFG", cfg), patch.object(
+            bot.ai_agent, "recent_activity", return_value=False
+        ), patch.object(bot.ai_agent, "ai_ready", return_value=True), patch.object(
+            bot.ai_agent, "run_agent", return_value="Automatic support reply"
+        ) as run_agent:
+            asyncio.run(bot.group_message(update, context))
+
+        run_agent.assert_called_once()
+        self.assertEqual("Automatic support reply", update.message.replies[-1][0])
+
+    def test_explicit_always_reply_off_keeps_ordinary_messages_silent(self):
+        update = DummyUpdate("Please answer my question.")
+        context = DummyContext()
+        cfg = {
+            "admin_chat_ids": [],
+            "groups": {
+                str(update.effective_chat.id): {
+                    "title": update.effective_chat.title,
+                    "routers": [],
+                    "always_reply": False,
+                }
+            },
+            "ai_enabled": True,
+            "ai_window_min": 30,
+            "slow_keywords": [],
+            "new_connect_keywords": [],
+            "greeting_keywords": [],
+            "port_keywords": [],
+            "non_duty_keywords": [],
+        }
+
+        with patch.object(bot, "CFG", cfg), patch.object(
+            bot.ai_agent, "recent_activity", return_value=False
+        ), patch.object(bot.ai_agent, "ai_ready", return_value=True), patch.object(
+            bot.ai_agent, "run_agent", return_value="Unexpected reply"
+        ) as run_agent:
+            asyncio.run(bot.group_message(update, context))
+
+        run_agent.assert_not_called()
+        self.assertEqual([], update.message.replies)
+
+
 class PrivateAdminRoutingTests(unittest.TestCase):
     def test_admin_private_chat_receives_configured_router_context(self):
         chat = DummyChat(chat_id=42, title="", chat_type="private")

@@ -576,7 +576,7 @@ async def cmd_always(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_config(CFG)
         await update.message.reply_text("✅ ALWAYS-REPLY OFF: back to smart keyword mode.")
     else:
-        state = entry.get("always_reply", False)
+        state = entry.get("always_reply", True)
         await update.message.reply_text(f"Always-reply is {'ON' if state else 'OFF'}. Use /always on or /always off")
 
 
@@ -1189,7 +1189,7 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     should_reply = (
         slow_hit or new_hit or greet_hit or port_hit or mentions_bot
         or reply_to_bot or active_chat
-        or bool(group_cfg and group_cfg.get("always_reply"))
+        or bool(group_cfg and group_cfg.get("always_reply", True))
     )
 
     if not should_reply:
