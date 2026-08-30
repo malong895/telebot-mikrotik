@@ -100,8 +100,13 @@ NETWORKS CONFIGURED FOR THIS GROUP:
 
 
 def _cfg():
-    with open(CONFIG_PATH, "r", encoding="utf-8-sig") as fh:
-        data = json.load(fh)
+    data = {}
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+        except Exception:
+            data = {}
     if os.environ.get("GROQ_API_KEY"):
         data["openai_api_key"] = os.environ["GROQ_API_KEY"]
     if os.environ.get("BOT_TOKEN"):
